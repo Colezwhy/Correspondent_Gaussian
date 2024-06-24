@@ -10,6 +10,7 @@ from einops import rearrange, repeat, reduce
 
 
 import threestudio
+from threestudio.systems.utils import parse_optimizer, parse_scheduler
 from threestudio.systems.base import BaseLift3DSystem
 from threestudio.utils.misc import cleanup, get_device
 from threestudio.utils.ops import binary_cross_entropy, dot
@@ -35,8 +36,8 @@ import torchvision.transforms as T
 import random
 import cv2
 
-@threestudio.register("corr-mvdream-system")
-class MVDreamSystem(BaseLift3DSystem):
+@threestudio.register("corr-mvdream-3dgs-system")
+class GS_MVDreamSystem(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         visualize_samples: bool = False
@@ -53,6 +54,19 @@ class MVDreamSystem(BaseLift3DSystem):
         )
         self.prompt_utils = self.prompt_processor()
 
+    # gaussian splatting(gaussaindreamer)
+    def configure_optimizers(self):
+        optim = self.geometry.optimizer
+        if hasattr(self, "merged_optimizer"):
+            return [optim]
+        if hasattr(self.cfg.optimizer, "name"):
+            net_optim = parse_optimizer(self.cfg.optimizer, self)
+            optim = self.geometry.merge_optimizer(net_optim)
+            self.merged_optimizer = True
+        else:
+            self.merged_optimizer = False
+        return [optim]
+    
     def on_load_checkpoint(self, checkpoint):
         for k in list(checkpoint["state_dict"].keys()):
             if k.startswith("guidance."):
@@ -68,9 +82,14 @@ class MVDreamSystem(BaseLift3DSystem):
             if k.startswith("guidance."):
                 checkpoint["state_dict"].pop(k)
         return
-
+    
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        return self.renderer(**batch)
+        self.geometry.update_learning_rate(self.global_step)
+        outputs = self.renderer.batch_forward(batch)
+        return outputs
 
     # NOTE: Create another version of the batch with azimuth-moved camera positions, to find easier correspondences.
     def copy_batch_azimuth_perturbation(self, batch, perturbation):
@@ -138,19 +157,30 @@ class MVDreamSystem(BaseLift3DSystem):
             "fovy": batch["fovy"],
             "focal_length": batch["focal_length"],
             "mvp_mtx": None,
+            # "need_grad": False,
         }
 
     def training_step(self, batch, batch_idx):
         assert self.cfg.loss.use_corr_loss, "Correspondence loss must be enabled"
-
+        opt = self.optimizers() # GS optimizer
         start_time = time.time_ns()
+        # =================== For correspondentDream feature similarity implementation =================== #
         num_imgs = bsize = batch["rays_o"].size(0)
         img_size = batch["height"]
 
         # OpenGL standard to OpenCV standard
         base_c2w = batch["c2w"] @ torch.diag(torch.FloatTensor([1, -1, -1, 1])).cuda()
-
+        # =================== For correspondentDream feature similarity implementation =================== #
+        # batch['need_grad'] = True
         out = self(batch)
+        # gs
+        visibility_filter = out["visibility_filter"]
+        radii = out["radii"]
+        viewspace_point_tensor = out["viewspace_points"] # viewspace_points are absolute coordinates of gaussians. why this is a list?
+        # print(viewspace_point_tensor.requires_grad)
+        # GS
+        
+        # =============== when deciding to use corr_loss ================ #
         if (
             self.true_global_step >= self.cfg.loss.use_corr_after
             and self.true_global_step < self.cfg.loss.use_corr_until
@@ -168,7 +198,7 @@ class MVDreamSystem(BaseLift3DSystem):
                     batch_corr["c2w"]
                     @ torch.diag(torch.FloatTensor([1, -1, -1, 1])).cuda()
                 )
-                out_corr = self(batch_corr)
+            out_corr = self(batch_corr) # here raising error for batch renderig output.
 
         if (
             self.true_global_step >= self.cfg.loss.use_corr_after
@@ -185,7 +215,7 @@ class MVDreamSystem(BaseLift3DSystem):
             self.true_global_step >= self.cfg.loss.use_corr_after
             and self.true_global_step < self.cfg.loss.use_corr_until
             and self.true_global_step % 2 == 0
-        ):
+        ):  # When we need the features to implement corr_loss, this is activated.
             with torch.no_grad():
                 guidance_out_corr = self.guidance(
                     out_corr["comp_rgb"],
@@ -194,7 +224,8 @@ class MVDreamSystem(BaseLift3DSystem):
                     noise=guidance_out["noise"],
                     **batch_corr,
                 )
-
+                
+        loss_sds = 0.0
         loss = 0.0
 
         if (
@@ -207,7 +238,7 @@ class MVDreamSystem(BaseLift3DSystem):
             for name, value in guidance_out.items():
                 if name.startswith("loss_"):
                     self.log(f"train/{name}", value)
-                    loss += value * self.C(
+                    loss_sds += value * self.C(
                         self.cfg.loss[name.replace("loss_", "lambda_")]
                     )
 
@@ -262,8 +293,8 @@ class MVDreamSystem(BaseLift3DSystem):
                     intrinsics[:2, -1] = batch["height"] / 2
 
                     # Filter out whose neighbours are of low opacity i.e., near edges
-                    src_opacity = (out["opacity"][i]).permute(2, 0, 1)
-                    trg_opacity = (out_corr["opacity"][i]).permute(2, 0, 1)
+                    src_opacity = (out["comp_mask"][i]).permute(2, 0, 1)
+                    trg_opacity = (out_corr["comp_mask"][i]).permute(2, 0, 1)
 
                     kernel_size = self.cfg.loss.edge_ksz
 
@@ -413,7 +444,7 @@ class MVDreamSystem(BaseLift3DSystem):
                     ]
 
                 # Depth of images d_A, d_B := rendered depths
-                d_A = out["depth"][i][sparse_indices_yx[:, 1], sparse_indices_yx[:, 0]]
+                d_A = out["comp_depth"][i][sparse_indices_yx[:, 1], sparse_indices_yx[:, 0]]
 
                 # 1. Source to target
                 pts_self_repr_in_other, depth_self_repr_in_other = (
@@ -470,7 +501,7 @@ class MVDreamSystem(BaseLift3DSystem):
                             con = ConnectionPatch(
                                 xyA=src_c,
                                 xyB=trg_c,
-                                coordsA=axes[i][4].transData,
+                                coordsA=axes[i][4].transData,   
                                 coordsB=axes[i][5].transData,
                                 axesA=axes[i][4],
                                 axesB=axes[i][5],
@@ -492,35 +523,57 @@ class MVDreamSystem(BaseLift3DSystem):
         # Corr loss implementation end                                       #
         ######################################################################
 
-        if self.C(self.cfg.loss.lambda_orient) > 0:
-            if "normal" not in out:
-                raise ValueError(
-                    "Normal is required for orientation loss, no normal is found in the output."
-                )
-            loss_orient = (
-                out["weights"].detach()
-                * dot(out["normal"], out["t_dirs"]).clamp_min(0.0) ** 2
-            ).sum() / (out["opacity"] > 0).sum()
-            self.log("train/loss_orient", loss_orient)
-            loss += loss_orient * self.C(self.cfg.loss.lambda_orient)
-
-        return {"loss": loss}
+        
+        # ===================== Orientation loss deprecated for instance ======================= #
+        # if self.C(self.cfg.loss.lambda_orient) > 0:
+        #     if "comp_normal" not in out:
+        #         raise ValueError(
+        #             "Normal is required for orientation loss, no normal is found in the output."
+        #         )
+        #     loss_orient = (
+        #         out["weights"].detach()
+        #         * dot(out["normal"], out["t_dirs"]).clamp_min(0.0) ** 2
+        #     ).sum() / (out["opacity"] > 0).sum()
+        #     self.log("train/loss_orient", loss_orient)
+        #     loss += loss_orient * self.C(self.cfg.loss.lambda_orient)
+        #  For GS
+        if (
+            self.true_global_step >= self.cfg.loss.use_corr_after
+            and self.true_global_step < self.cfg.loss.use_corr_until
+            and self.true_global_step % 2 == 0
+        ):
+            if loss > 0:
+                loss.backward(retain_graph=True)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            return {"loss": loss}
+        else:
+            # This needs sds loss has back propagation value.
+            loss_sds.backward(retain_graph=True)
+            iteration = self.global_step
+            self.geometry.update_states(
+                iteration,
+                visibility_filter,
+                radii,
+                viewspace_point_tensor,
+            )
+            # if loss > 0: # actually we do not have this term.
+            #     loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            return {"loss": loss_sds}
 
     def validation_step(self, batch, batch_idx):
         out = self(batch)
         self.save_image_grid(
             f"it{self.true_global_step}-{batch['index'][0]}.png",
-            (
-                [
-                    {
-                        "type": "rgb",
-                        "img": out["comp_rgb"][0],
-                        "kwargs": {"data_format": "HWC"},
-                    },
-                ]
-                if "comp_rgb" in out
-                else []
-            )
+            [
+                {
+                    "type": "rgb",
+                    "img": out["comp_rgb"][0],
+                    "kwargs": {"data_format": "HWC"},
+                },
+            ]
             + (
                 [
                     {
@@ -532,13 +585,17 @@ class MVDreamSystem(BaseLift3DSystem):
                 if "comp_normal" in out
                 else []
             )
-            + [
-                {
-                    "type": "grayscale",
-                    "img": out["opacity"][0, :, :, 0],
-                    "kwargs": {"cmap": None, "data_range": (0, 1)},
-                },
-            ],
+            + (
+                [
+                    {
+                        "type": "rgb",
+                        "img": out["comp_pred_normal"][0],
+                        "kwargs": {"data_format": "HWC", "data_range": (0, 1)},
+                    }
+                ]
+                if "comp_pred_normal" in out
+                else []
+            ),
             name="validation_step",
             step=self.true_global_step,
         )
@@ -550,17 +607,13 @@ class MVDreamSystem(BaseLift3DSystem):
         out = self(batch)
         self.save_image_grid(
             f"it{self.true_global_step}-test/{batch['index'][0]}.png",
-            (
-                [
-                    {
-                        "type": "rgb",
-                        "img": out["comp_rgb"][0],
-                        "kwargs": {"data_format": "HWC"},
-                    },
-                ]
-                if "comp_rgb" in out
-                else []
-            )
+            [
+                {
+                    "type": "rgb",
+                    "img": out["comp_rgb"][0],
+                    "kwargs": {"data_format": "HWC"},
+                },
+            ]
             + (
                 [
                     {
@@ -572,16 +625,23 @@ class MVDreamSystem(BaseLift3DSystem):
                 if "comp_normal" in out
                 else []
             )
-            + [
-                {
-                    "type": "grayscale",
-                    "img": out["opacity"][0, :, :, 0],
-                    "kwargs": {"cmap": None, "data_range": (0, 1)},
-                },
-            ],
+            + (
+                [
+                    {
+                        "type": "rgb",
+                        "img": out["comp_pred_normal"][0],
+                        "kwargs": {"data_format": "HWC", "data_range": (0, 1)},
+                    }
+                ]
+                if "comp_pred_normal" in out
+                else []
+            ),
             name="test_step",
             step=self.true_global_step,
         )
+        if batch["index"][0] == 0:
+            save_path = self.get_save_path("point_cloud.ply")
+            self.geometry.save_ply(save_path)
 
     def on_test_epoch_end(self):
         self.save_img_sequence(

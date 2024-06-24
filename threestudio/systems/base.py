@@ -7,9 +7,19 @@ import torch.nn.functional as F
 import threestudio
 from threestudio.models.exporters.base import Exporter, ExporterOutput
 from threestudio.systems.utils import parse_optimizer, parse_scheduler
-from threestudio.utils.base import Updateable, update_if_possible
+from threestudio.utils.base import (
+    Updateable,
+    update_end_if_possible,
+    update_if_possible,
+)
 from threestudio.utils.config import parse_structured
-from threestudio.utils.misc import C, cleanup, get_device, load_module_weights
+from threestudio.utils.misc import (
+    C,
+    cleanup,
+    find_last_path,
+    get_device,
+    load_module_weights,
+)
 from threestudio.utils.saving import SaverMixin
 from threestudio.utils.typing import *
 
@@ -107,7 +117,19 @@ class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
     def validation_step(self, batch, batch_idx):
         raise NotImplementedError
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        self.dataset = self.trainer.train_dataloader.dataset
+        update_end_if_possible(
+            self.dataset, self.true_current_epoch, self.true_global_step
+        )
+        self.do_update_step_end(self.true_current_epoch, self.true_global_step)
+
     def on_validation_batch_end(self, outputs, batch, batch_idx):
+        self.dataset = self.trainer.val_dataloaders.dataset
+        update_end_if_possible(
+            self.dataset, self.true_current_epoch, self.true_global_step
+        )
+        self.do_update_step_end(self.true_current_epoch, self.true_global_step)
         if self.cfg.cleanup_after_validation_step:
             # cleanup to save vram
             cleanup()
@@ -119,6 +141,11 @@ class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
         raise NotImplementedError
 
     def on_test_batch_end(self, outputs, batch, batch_idx):
+        self.dataset = self.trainer.test_dataloaders.dataset
+        update_end_if_possible(
+            self.dataset, self.true_current_epoch, self.true_global_step
+        )
+        self.do_update_step_end(self.true_current_epoch, self.true_global_step)
         if self.cfg.cleanup_after_test_step:
             # cleanup to save vram
             cleanup()
@@ -130,6 +157,11 @@ class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
         raise NotImplementedError
 
     def on_predict_batch_end(self, outputs, batch, batch_idx):
+        self.dataset = self.trainer.predict_dataloaders.dataset
+        update_end_if_possible(
+            self.dataset, self.true_current_epoch, self.true_global_step
+        )
+        self.do_update_step_end(self.true_current_epoch, self.true_global_step)
         if self.cfg.cleanup_after_test_step:
             # cleanup to save vram
             cleanup()
@@ -215,6 +247,8 @@ class BaseLift3DSystem(BaseSystem):
     cfg: Config
 
     def configure(self) -> None:
+        self.cfg.geometry_convert_from = find_last_path(self.cfg.geometry_convert_from)
+        self.cfg.weights = find_last_path(self.cfg.weights)
         if (
             self.cfg.geometry_convert_from  # from_coarse must be specified
             and not self.cfg.weights  # not initialized from coarse when weights are specified

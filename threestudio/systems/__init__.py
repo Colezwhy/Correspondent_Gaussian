@@ -12,4 +12,5 @@ from . import (
     zero123,
     mvdream,
     corr_mvdream,
+    corr_gs
 )

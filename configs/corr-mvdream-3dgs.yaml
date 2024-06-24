@@ -1,0 +1,151 @@
+name: "mvdream-3dgs-rescale0.5-shading"
+tag: "${rmspace:${system.prompt_processor.prompt},_}"
+exp_root_dir: "outputs/gaussian_splatting"
+seed: 0
+
+data_type: "random-multiview-camera-datamodule"
+data:
+  batch_size: [8,4] # must be dividable by n_view
+  n_view: 4
+  # 0-4999: 64x64, >=5000: 256x256
+  width: [32, 128]
+  height: ${data.width} #[32, 128]
+  resolution_milestones: [6000]
+  camera_distance_range: [0.8, 1.0] # relative
+  fovy_range: [15, 60]
+  elevation_range: [0, 30]
+  up_perturb: 0.
+  camera_perturb: 0.
+  center_perturb: 0.
+  n_val_views: 4
+  eval_camera_distance: 4.0
+  eval_fovy_deg: 40.
+  eval_width: 1024
+  eval_height: 1024
+
+system_type: "corr-mvdream-3dgs-system"
+system:
+# Changed for gaussian splatting.
+  geometry_type: "gaussiansplatting-base"
+  geometry:
+    position_lr: 0.00005
+    scale_lr: 0.005
+    feature_lr: 0.01
+    opacity_lr: 0.01
+    rotation_lr: 0.001
+    pred_normal: false
+    normal_lr: 0.005
+
+    densification_interval: 100
+    prune_interval: 100
+    densify_from_iter: 300
+    densify_until_iter: 900
+    prune_from_iter: 300
+    prune_until_iter: 900
+    opacity_reset_interval: 100000
+
+    densify_grad_threshold: 0.0002
+    min_opac_prune: 0.05
+    split_thresh: 0.04
+    radii2d_thresh: 1000
+
+    opacity_init: 0.1
+    pc_init_radius: 1.6
+
+  material_type: "diffuse-with-point-light-material"
+  material:
+    ambient_only_steps: 6000
+    textureless_prob: 0.5
+    ambient_light_color: [1.0, 1.0, 1.0]
+    diffuse_light_color: [0.0, 0.0, 0.0]
+    soft_shading: true
+    albedo_activation: sigmoid
+
+  background_type: "gaussiandreamer-background"
+  background:
+    color_activation: sigmoid
+    random_aug: true
+    share_aug_bg: true
+    random_aug_prob: 0.95
+
+  renderer_type: "gaussiandreamer-rasterizer"
+  renderer:
+    debug: false
+    invert_bg_prob: 0.5
+
+  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor:
+    pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+    prompt: ???
+    negative_prompt: "ugly, bad anatomy, blurry, pixelated obscure, unnatural colors, poor lighting, dull, and unclear, cropped, lowres, low quality, artifacts, duplicate, morbid, mutilated, poorly drawn face, deformed, dehydrated, bad proportions"
+    front_threshold: 30.
+    back_threshold: 30.
+
+  guidance_type: "corr-multiview-diffusion-guidance"
+  guidance:
+    model_name: "sd-v2.1-base-4view"
+    ckpt_path: null # path to a pre-downloaded checkpoint file (null for loading from URL)
+    guidance_scale: 50.0
+    min_step_percent: [0, 0.98, 0.02, 9600]  # (start_iter, start_val, end_val, end_iter)
+    max_step_percent: [0, 0.98, 0.50, 9600]
+    recon_loss: true
+    recon_std_rescale: 0.5
+    use_freeu_until: 0
+
+  loggers:
+    wandb:
+      enable: false
+      project: "threestudio"
+
+  exporter_type: "gaussiandreamer-mesh-exporter"
+
+  loss:
+    lambda_sds: 1.
+    # lambda_orient: [0, 10., 1000., 6000]
+    lambda_sparsity: 0.
+    lambda_opaque: 0.
+    lambda_z_variance: 0.
+    use_corr_loss: true
+    lambda_corr: 1000
+    use_corr_after: 0
+    use_corr_until: 7000
+    azimuth_perturbation_start: 10
+    azimuth_perturbation_end: 30
+    edge_ksz: 3
+    max_corr: 60000
+    epipolar_thres: 2
+    visualize: 0
+    visualize_name: "placeholder"
+    lambda_position: 0.
+    lambda_opacity: 0.
+    lambda_scales: 0.
+    lambda_tv_loss: 0.0
+    lambda_depth_tv_loss: 0.
+
+  # optimizer:
+  #   name: AdamW
+  #   args:
+      # betas: [0.9, 0.99]
+      # eps: 1.e-15
+    # params:
+      # geometry.encoding:
+      #   lr: 0.01
+      # geometry.density_network:
+      #   lr: 0.001
+      # geometry.feature_network:
+      #   lr: 0.001
+      # background:
+      #   lr: 0.001
+
+trainer:
+  max_steps: 12000
+  log_every_n_steps: 1
+  num_sanity_val_steps: 1
+  val_check_interval: 2000
+  enable_progress_bar: true
+  precision: 32-true
+
+checkpoint:
+  save_last: true # also saving at each validation time.
+  save_top_k: -1
+  every_n_train_steps: 1000
